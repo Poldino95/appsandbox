@@ -15,6 +15,7 @@ EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "agent", "tools\agent\agent.vcxproj", "{D4E5F6A7-B8C9-0123-4567-89ABCDEF0123}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "nvapi-proxy", "tools\nvapi-proxy\nvapi-proxy.vcxproj", "{7C1D9E2A-4F3B-4A6D-9E51-2B8C0D4E6F10}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "nvvk-shim", "tools\nvvk-shim\nvvk-shim.vcxproj", "{3E8F1B2C-9D4A-4C7E-8A15-6F2B0C9D3E71}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "iso-patch", "tools\iso-patch\iso-patch.vcxproj", "{A1B2C3D4-5678-9ABC-DEF0-123456789ABC}"
