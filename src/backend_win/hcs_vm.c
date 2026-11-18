@@ -885,6 +885,14 @@ static BOOL hcs_nested_virt_supported(void)
     return g_nested_virt == 1;
 }
 
+/* Guest state reuse. vm.vmgs holds the UEFI variables and the vTPM, so
+   recreating it on every start resets the TPM and invalidates everything the
+   guest sealed to it (Windows Hello PINs, TPM-protected credentials). The
+   existing file is kept; only if HCS rejects it is a fresh one created.
+   Per thread because VMs are started from background threads. */
+static __declspec(thread) BOOL t_guest_state_fresh;  /* in: force a new vm.vmgs */
+static __declspec(thread) BOOL t_guest_state_reused; /* out: existing vm.vmgs kept */
+
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
@@ -977,7 +985,12 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        deletion, so reset the DACL before deleting. */
     vmgs_hr = S_OK;
     vmrs_hr = S_OK;
-    if (pfnCreateVmgs) {
+    t_guest_state_reused = FALSE;
+    if (pfnCreateVmgs && !t_guest_state_fresh && !config->is_template &&
+        GetFileAttributesW(vmgs_path) != INVALID_FILE_ATTRIBUTES &&
+        (!pfnGrantAccess || SUCCEEDED(pfnGrantAccess(config->name, vmgs_path)))) {
+        t_guest_state_reused = TRUE;
+    } else if (pfnCreateVmgs) {
         if (!DeleteFileW(vmgs_path) &&
             GetLastError() == ERROR_ACCESS_DENIED) {
             /* Reset DACL to allow delete — stale HcsGrantVmAccess ACLs */
@@ -1278,6 +1291,23 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         }
     }
 
+    /* The kept guest state can be rejected, e.g. 0x80370118 after a Secure
+       Boot change: start once more from a fresh one, as before. */
+    if (FAILED(hr) && t_guest_state_reused) {
+        BOOL built;
+        ui_log(L"VM create failed with the existing guest state (0x%08X), retrying with a fresh one...", hr);
+        t_guest_state_fresh = TRUE;
+        built = hcs_build_vm_json(config, NULL, json, 16384);
+        t_guest_state_fresh = FALSE;
+        if (built) {
+            op = pfnCreateOp(NULL, NULL);
+            if (op) {
+                hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
+                hr = hcs_exec_and_wait(hr, op);
+            }
+        }
+    }
+
     if (SUCCEEDED(hr)) {
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
@@ -1368,6 +1398,23 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         if (op) {
             hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
             hr = hcs_exec_and_wait(hr, op);
+        }
+    }
+
+    /* The kept guest state can be rejected, e.g. 0x80370118 after a Secure
+       Boot change: start once more from a fresh one, as before. */
+    if (FAILED(hr) && t_guest_state_reused) {
+        BOOL built;
+        ui_log(L"VM create failed with the existing guest state (0x%08X), retrying with a fresh one...", hr);
+        t_guest_state_fresh = TRUE;
+        built = hcs_build_vm_json(config, endpoint_guid, json, 16384);
+        t_guest_state_fresh = FALSE;
+        if (built) {
+            op = pfnCreateOp(NULL, NULL);
+            if (op) {
+                hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
+                hr = hcs_exec_and_wait(hr, op);
+            }
         }
     }
 
