@@ -23,6 +23,8 @@ typedef HRESULT (WINAPI *PFN_HcnCloseNetwork)(void *network);
 typedef HRESULT (WINAPI *PFN_HcnCloseEndpoint)(void *endpoint);
 typedef HRESULT (WINAPI *PFN_HcnOpenNetwork)(
     REFGUID id, void **network, PWSTR *errorRecord);
+typedef HRESULT (WINAPI *PFN_HcnQueryNetworkProperties)(
+    void *network, PCWSTR query, PWSTR *properties, PWSTR *errorRecord);
 
 /* ---- Loaded function pointers ---- */
 
@@ -36,6 +38,7 @@ static PFN_HcnDeleteEndpoint   pfnDeleteEp;
 static PFN_HcnCloseNetwork     pfnCloseNet;
 static PFN_HcnCloseEndpoint    pfnCloseEp;
 static PFN_HcnOpenNetwork      pfnOpenNet;
+static PFN_HcnQueryNetworkProperties pfnQueryNet;
 
 /* ---- Helpers ---- */
 
@@ -69,6 +72,7 @@ BOOL hcn_init(void)
     pfnCloseEp    = (PFN_HcnCloseEndpoint)GetProcAddress(g_hcn_dll, "HcnCloseEndpoint");
     pfnOpenNet    = (PFN_HcnOpenNetwork)GetProcAddress(g_hcn_dll, "HcnOpenNetwork");
     pfnEnumNet    = (PFN_HcnEnumerateNetworks)GetProcAddress(g_hcn_dll, "HcnEnumerateNetworks");
+    pfnQueryNet   = (PFN_HcnQueryNetworkProperties)GetProcAddress(g_hcn_dll, "HcnQueryNetworkProperties");
 
     if (!pfnCreateNet || !pfnCreateEp || !pfnCloseNet || !pfnCloseEp) {
         FreeLibrary(g_hcn_dll);
@@ -94,6 +98,196 @@ static const GUID APPSANDBOX_EXTERNAL_GUID = {
     0xA5B01234, 0x5678, 0x9ABC,
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x88 }
 };
+
+/* TRUE for the three networks App Sandbox creates itself. Anything else was
+   created by someone else (Hyper-V Manager, New-VMSwitch, WSL, Docker...) and
+   is only ever borrowed: endpoints are added and removed, the network stays. */
+static BOOL is_appsandbox_network(const GUID *id)
+{
+    return IsEqualGUID(id, &APPSANDBOX_NAT_GUID) ||
+           IsEqualGUID(id, &APPSANDBOX_INTERNAL_GUID) ||
+           IsEqualGUID(id, &APPSANDBOX_EXTERNAL_GUID);
+}
+
+/* ---- Reusing an existing external switch ----
+   A physical adapter can back only one virtual switch. If the adapter already
+   belongs to a Hyper-V external switch (created for Hyper-V VMs, or for WSL
+   bridged networking), HcnCreateNetwork on it fails. Every virtual switch is
+   also an HCN network whose Name is the switch name, so instead of creating a
+   second network we attach our endpoints to the existing one. */
+
+/* Copy the value of the top-level "Name" member of an HCN properties JSON
+   document. Nested objects (policies, subnets) are skipped. */
+static BOOL json_top_level_name(const wchar_t *json, wchar_t *out, size_t out_len)
+{
+    int depth = 0;
+    const wchar_t *p = json;
+
+    while (*p) {
+        if (*p == L'"') {
+            const wchar_t *start = ++p;
+            size_t len;
+            while (*p && *p != L'"') {
+                if (*p == L'\\' && p[1]) p++;
+                p++;
+            }
+            if (!*p) return FALSE;
+            len = (size_t)(p - start);
+            p++;
+            if (depth == 1 && len == 4 && wcsncmp(start, L"Name", 4) == 0) {
+                size_t n = 0;
+                while (*p == L' ' || *p == L'\t' || *p == L'\r' || *p == L'\n') p++;
+                if (*p != L':') continue;
+                p++;
+                while (*p == L' ' || *p == L'\t' || *p == L'\r' || *p == L'\n') p++;
+                if (*p != L'"') return FALSE;
+                p++;
+                while (*p && *p != L'"') {
+                    if (*p == L'\\' && p[1]) p++;
+                    if (n + 1 < out_len) out[n++] = *p;
+                    p++;
+                }
+                out[n] = L'\0';
+                return *p == L'"';
+            }
+            continue;
+        }
+        if (*p == L'{' || *p == L'[') depth++;
+        else if (*p == L'}' || *p == L']') depth--;
+        p++;
+    }
+    return FALSE;
+}
+
+static BOOL parse_guid(const wchar_t *text, GUID *out)
+{
+    wchar_t braced[40];
+    if (wcslen(text) < 36) return FALSE;
+    braced[0] = L'{';
+    wcsncpy_s(braced + 1, 38, text, 36);
+    braced[37] = L'}';
+    braced[38] = L'\0';
+    return SUCCEEDED(CLSIDFromString(braced, out));
+}
+
+/* Look up an existing HCN network by name (case-insensitive). */
+static BOOL find_network_by_name(const wchar_t *name, GUID *out_id)
+{
+    PWSTR list = NULL, er = NULL;
+    const wchar_t *p;
+    BOOL found = FALSE;
+
+    if (!pfnEnumNet || !pfnOpenNet || !pfnQueryNet || !name || !name[0])
+        return FALSE;
+    if (FAILED(pfnEnumNet(NULL, &list, &er)) || !list) {
+        if (er) CoTaskMemFree(er);
+        if (list) CoTaskMemFree(list);
+        return FALSE;
+    }
+    if (er) { CoTaskMemFree(er); er = NULL; }
+
+    /* The result is a JSON array of GUID strings. */
+    for (p = list; !found && (p = wcschr(p, L'"')) != NULL; ) {
+        const wchar_t *end = wcschr(p + 1, L'"');
+        GUID id;
+        if (!end) break;
+        if (end - (p + 1) == 36 && parse_guid(p + 1, &id) && !is_appsandbox_network(&id)) {
+            void *network = NULL;
+            PWSTR props = NULL;
+            if (SUCCEEDED(pfnOpenNet(&id, &network, &er)) && network) {
+                wchar_t net_name[256];
+                if (er) { CoTaskMemFree(er); er = NULL; }
+                if (SUCCEEDED(pfnQueryNet(network, NULL, &props, &er)) && props &&
+                    json_top_level_name(props, net_name, ARRAYSIZE(net_name)) &&
+                    _wcsicmp(net_name, name) == 0) {
+                    *out_id = id;
+                    found = TRUE;
+                }
+                if (props) CoTaskMemFree(props);
+                if (pfnCloseNet) pfnCloseNet(network);
+            }
+            if (er) { CoTaskMemFree(er); er = NULL; }
+        }
+        p = end + 1;
+    }
+    CoTaskMemFree(list);
+    return found;
+}
+
+/* If `adapter` (a physical adapter's friendly name, or empty for auto-detect)
+   is already bound to a Hyper-V external switch, return that switch's name.
+   The host's own virtual adapter on such a switch is called "vEthernet (<switch>)"
+   and carries the physical adapter's MAC address. */
+static BOOL switch_name_for_adapter(const wchar_t *adapter, wchar_t *out, size_t out_len)
+{
+    ULONG size = 0;
+    PIP_ADAPTER_ADDRESSES buf, phys, v;
+    const ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_ALL_INTERFACES |
+                        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+    BOOL found = FALSE;
+
+    GetAdaptersAddresses(AF_UNSPEC, flags, NULL, NULL, &size);
+    if (size == 0) return FALSE;
+    buf = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, size);
+    if (!buf) return FALSE;
+    if (GetAdaptersAddresses(AF_UNSPEC, flags, NULL, buf, &size) != NO_ERROR) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return FALSE;
+    }
+
+    for (phys = buf; phys && !found; phys = phys->Next) {
+        if (wcsncmp(phys->FriendlyName, L"vEthernet (", 11) == 0) continue;
+        if (phys->IfType != IF_TYPE_ETHERNET_CSMACD && phys->IfType != IF_TYPE_IEEE80211) continue;
+        if (phys->PhysicalAddressLength != 6) continue;
+        if (adapter && adapter[0] && _wcsicmp(phys->FriendlyName, adapter) != 0) continue;
+
+        for (v = buf; v; v = v->Next) {
+            const wchar_t *name = v->FriendlyName;
+            size_t len = wcslen(name);
+            if (wcsncmp(name, L"vEthernet (", 11) != 0 || len < 13 || name[len - 1] != L')') continue;
+            if (v->OperStatus != IfOperStatusUp) continue;
+            if (v->PhysicalAddressLength != 6 ||
+                memcmp(v->PhysicalAddress, phys->PhysicalAddress, 6) != 0) continue;
+            /* Auto-detect: only a switch that actually reaches the network. */
+            if ((!adapter || !adapter[0]) && v->FirstGatewayAddress == NULL) continue;
+            wcsncpy_s(out, out_len, name + 11, len - 12);
+            found = TRUE;
+            break;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+    return found;
+}
+
+/* Find an existing network to use for External mode instead of creating one.
+   `adapter` may be a switch name, "vEthernet (<switch>)", a physical adapter
+   that is already bound to a switch, or empty (auto-detect). */
+static BOOL find_existing_external_network(const wchar_t *adapter, GUID *out_id,
+                                           wchar_t *out_name, size_t name_len)
+{
+    wchar_t name[256];
+
+    if (adapter && adapter[0]) {
+        size_t len = wcslen(adapter);
+        if (find_network_by_name(adapter, out_id)) {
+            wcscpy_s(out_name, name_len, adapter);
+            return TRUE;
+        }
+        if (wcsncmp(adapter, L"vEthernet (", 11) == 0 && len >= 13 && adapter[len - 1] == L')') {
+            wcsncpy_s(name, ARRAYSIZE(name), adapter + 11, len - 12);
+            if (find_network_by_name(name, out_id)) {
+                wcscpy_s(out_name, name_len, name);
+                return TRUE;
+            }
+        }
+    }
+    if (switch_name_for_adapter(adapter, name, ARRAYSIZE(name)) &&
+        find_network_by_name(name, out_id)) {
+        wcscpy_s(out_name, name_len, name);
+        return TRUE;
+    }
+    return FALSE;
+}
 
 /* Find the adapter that carries the default route (0.0.0.0/0). */
 /* Find a physical adapter that is UP, has a default gateway, and isn't virtual.
@@ -419,6 +613,21 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
         return S_OK;
     }
 
+    /* The adapter may already belong to an external switch (Hyper-V, WSL
+       bridged): share that switch instead of trying to create a second one. */
+    {
+        GUID existing;
+        wchar_t existing_name[256];
+        if (find_existing_external_network(adapter_name, &existing,
+                                           existing_name, ARRAYSIZE(existing_name))) {
+            *network_id = existing;
+            ui_log(L"External network: using existing switch \"%s\" (not managed by App Sandbox).",
+                   existing_name);
+            ReleaseSRWLockExclusive(&g_network_lock);
+            return S_OK;
+        }
+    }
+
     /* Use specified adapter, or auto-detect */
     if (adapter_name && adapter_name[0] != L'\0') {
         wcscpy_s(adapter, 256, adapter_name);
@@ -489,7 +698,32 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     if (error_record) { LocalFree(error_record); error_record = NULL; }
     if (FAILED(hr)) return hr;
 
-    CoCreateGuid(endpoint_id);
+    if (is_appsandbox_network(network_id)) {
+        CoCreateGuid(endpoint_id);
+    } else {
+        /* Our own networks are deleted and recreated at startup, which also
+           removes any endpoint left behind by a crash. A borrowed network is
+           never deleted, so give the endpoint an id derived from the VM's MAC
+           address and remove a leftover with that id before creating it. */
+        static const GUID base = {
+            0xA5B01234, 0x5678, 0x9ABC,
+            { 0xE0, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+        };
+        unsigned int b[6];
+        int i;
+        *endpoint_id = base;
+        if (swscanf_s(mac_address, L"%2x%*c%2x%*c%2x%*c%2x%*c%2x%*c%2x",
+                      &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+            if (pfnCloseNet) pfnCloseNet(network);
+            return E_INVALIDARG;
+        }
+        for (i = 0; i < 6; i++)
+            endpoint_id->Data4[2 + i] = (unsigned char)b[i];
+        if (pfnDeleteEp) {
+            pfnDeleteEp(endpoint_id, &error_record);
+            if (error_record) { LocalFree(error_record); error_record = NULL; }
+        }
+    }
     guid_to_string(network_id, net_guid_str, 64);
     guid_to_string(endpoint_id, ep_guid_str, 64);
 
@@ -542,6 +776,11 @@ HRESULT hcn_delete_network(const GUID *network_id)
 
     if (!g_hcn_dll || !pfnDeleteNet)
         return E_NOT_VALID_STATE;
+
+    /* A borrowed switch belongs to whoever created it and may be carrying the
+       host's own connection: only our own networks are ever deleted. */
+    if (!is_appsandbox_network(network_id))
+        return S_OK;
 
     StringFromGUID2(network_id, guid_str, 64);
     ui_log(L"HCN: Deleting network %s...", guid_str);
